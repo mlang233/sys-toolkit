@@ -74,12 +74,29 @@ elif name == 'launchctl':
     statefile = root/'launch-state.json'
     state = json.loads(statefile.read_text()) if statefile.exists() else {}
     with (root/'launch-calls').open('a') as f: f.write(' '.join(a) + '\\n')
+
+    def save():
+        statefile.write_text(json.dumps(state))
     if a[0] == 'print':
-        if a[1] not in state: sys.exit(113)
-        print('state = running\\npid = 42' if state[a[1]] == 'running' else 'state = waiting')
+        value = state.get(a[1])
+        if value is None: sys.exit(113)
+        # 模拟真实 launchd：bootout 返回后 job 仍需若干次查询才真正消失。
+        if str(value).startswith('unloading:'):
+            left = int(str(value).split(':', 1)[1]) - 1
+            if left <= 0:
+                state.pop(a[1], None)
+                save()
+                sys.exit(113)
+            state[a[1]] = 'unloading:' + str(left)
+            save()
+            print('state = running\\npid = 42')
+            sys.exit(0)
+        print('state = running\\npid = 42' if value == 'running' else 'state = waiting')
     elif a[0] == 'bootout':
         if os.environ.get('FAKE_BOOTOUT_FAIL'): sys.exit(5)
-        state.pop(a[1], None)
+        if os.environ.get('FAKE_UNLOAD_LAG'): state[a[1]] = 'unloading:' + os.environ['FAKE_UNLOAD_LAG']
+        else: state.pop(a[1], None)
+        save()
     elif a[0] == 'bootstrap':
         p = plistlib.load(open(a[2], 'rb'))
         key = a[1] + '/' + p['Label']
@@ -92,10 +109,11 @@ elif name == 'launchctl':
             manager_pid = int((root/'active-manager-pid').read_text())
             os.kill(manager_pid, signal.SIGTERM)
             sys.exit(5)
-        if key in state: sys.exit(5)
+        if state.get(key) is not None: sys.exit(5)
         state[key] = 'waiting' if os.environ.get('FAKE_NOT_RUNNING') else 'running'
+        save()
     elif a[0] == 'kickstart': state[a[-1]] = 'running'
-    statefile.write_text(json.dumps(state))
+    save()
 else: sys.exit('Unexpected mock tool: ' + name)
 '''
 
@@ -155,6 +173,16 @@ class ManagerTests(unittest.TestCase):
     def assert_clean(self):
         self.assertFalse((self.base/'.lock').exists())
         self.assertEqual(list(self.base.glob('.stage.*')), [])
+
+    def assert_clean_base(self, base):
+        self.assertFalse((base/'.lock').exists())
+        self.assertEqual(list(base.glob('.stage.*')), [])
+
+    def base_system(self):
+        return self.root/'system data/mihomo'
+
+    def persist_system(self):
+        return self.root/'system agents/io.github.sys-toolkit.mihomo.plist'
 
     def test_help_without_platform_or_dependencies(self):
         self.assertIn('macOS', self.run_cmd('help', extra={'FAKE_OS': 'Linux'}).stdout)
@@ -405,6 +433,95 @@ rules:
         finally:
             os.close(master)
             os.close(slave)
+
+    def test_unload_waits_for_async_bootout_before_restart(self):
+        # 回归：bootout 成功但 launchd 尚未卸载完成时，立即 bootstrap 会返回
+        # Bootstrap failed: 5: Input/output error；修复后应先等待卸载完成。
+        self.install()
+        self.run_cmd('start')
+        old = (self.base/'run/config.yaml').read_bytes()
+        r = self.run_cmd('config', 'set', self.config_file('rules: [MATCH,DIRECT]\n# async unload\n'),
+                         extra={'FAKE_UNLOAD_LAG': '3'})
+        self.assertIn('配置已更新', r.stdout)
+        self.assertNotEqual((self.base/'run/config.yaml').read_bytes(), old)
+        self.assertIn('服务：运行中', self.run_cmd('status').stdout)
+        self.assert_clean()
+
+    def test_enable_tun_requires_system_mode(self):
+        # 用户模式必须在建目录/取锁之前拒绝，避免留下半成品状态。
+        for cmd in ('enable-tun', 'disable-tun'):
+            with self.subTest(cmd=cmd):
+                r = self.run_cmd(cmd, ok=False)
+                self.assertIn('sudo mm --system ' + cmd, r.stdout + r.stderr)
+        self.assertFalse(self.base.exists())
+        self.assertFalse((self.root/'system data').exists())
+
+    def test_enable_tun_rejects_config_without_tun_section(self):
+        env = {'FAKE_UID': '0'}
+        self.run_cmd('--system', 'install', extra=env)
+        r = self.run_cmd('--system', 'enable-tun', self.config_file('rules: [MATCH,DIRECT]\n'), ok=False, extra=env)
+        self.assertIn('没有顶层 tun 段', r.stdout + r.stderr)
+        self.assertFalse(self.persist_system().exists())
+        self.assert_clean_base(self.base_system())
+
+    def test_enable_tun_imports_config_flips_enable_and_sets_autostart(self):
+        env = {'FAKE_UID': '0'}
+        source = self.config_file('mixed-port: 7892\ntun:\n  enable: false # 保持注释\n  stack: mixed\n  auto-route: true\n  dns-hijack:\n    - any:53\nrules:\n  - MATCH,DIRECT\n')
+        self.run_cmd('--system', 'install', extra=env)
+        self.run_cmd('--system', 'enable-tun', source, extra=env)
+        base = self.base_system()
+        config = (base/'run/config.yaml').read_text()
+        self.assertIn('  enable: true # 保持注释', config)
+        self.assertIn('  stack: mixed', config)
+        self.assertIn('  dns-hijack:', config)
+        self.assertEqual((base/'tun-mode').read_text(), 'mode=persistent\n')
+        self.assertTrue(self.persist_system().exists())
+        self.assertIn('bootstrap system ', (self.root/'launch-calls').read_text())
+        self.assertIn('TUN 模式：已启用（系统实例 + 开机自启）', self.run_cmd('--system', 'status', extra=env).stdout)
+        self.assertIn('TUN 模式记录', self.run_cmd('--system', 'info', extra=env).stdout)
+        self.assert_clean_base(base)
+
+    def test_enable_tun_inserts_enable_when_missing_and_installs_first(self):
+        env = {'FAKE_UID': '0'}
+        source = self.config_file('tun:\n  stack: system\n  auto-route: true\nrules:\n  - MATCH,DIRECT\n')
+        self.run_cmd('--system', 'enable-tun', source, extra=env)
+        base = self.base_system()
+        self.assertTrue((base/'bin/mihomo').exists())
+        self.assertIn('  enable: true', (base/'run/config.yaml').read_text())
+        self.assertEqual((base/'tun-mode').read_text(), 'mode=persistent\n')
+
+    def test_disable_tun_stops_service_and_removes_autostart(self):
+        env = {'FAKE_UID': '0'}
+        source = self.config_file('tun:\n  enable: true\n  stack: system\nrules:\n  - MATCH,DIRECT\n')
+        self.run_cmd('--system', 'enable-tun', source, extra=env)
+        base = self.base_system()
+        self.assertIn('服务：运行中', self.run_cmd('--system', 'status', extra=env).stdout)
+        self.run_cmd('--system', 'disable-tun', extra=env)
+        self.assertFalse(self.persist_system().exists())
+        self.assertEqual((base/'tun-mode').read_text(), 'mode=user\n')
+        status = self.run_cmd('--system', 'status', extra=env).stdout
+        self.assertIn('TUN 模式：系统实例仅手动启动', status)
+        self.assertIn('服务：未加载', status)
+        self.assert_clean_base(base)
+
+    def test_menu_enable_tun_dispatch_in_system_mode(self):
+        env = dict(self.env, FAKE_UID='0')
+        self.run_cmd('--system', 'install', extra={'FAKE_UID': '0'})
+        self.run_cmd('--system', 'config', 'set',
+                     self.config_file('tun:\n  enable: false\n  stack: system\nrules:\n  - MATCH,DIRECT\n'),
+                     extra={'FAKE_UID': '0'})
+        master, slave = pty.openpty()
+        try:
+            os.write(master, b'20\n0\n')
+            r = subprocess.run(['/bin/bash', str(self.script), '--system'], env=env, stdin=slave,
+                               capture_output=True, text=True, timeout=30)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn('TUN 模式已启用', r.stdout)
+        finally:
+            os.close(master)
+            os.close(slave)
+        self.assertIn('  enable: true', (self.base_system()/'run/config.yaml').read_text())
+        self.assertTrue(self.persist_system().exists())
 
     def test_platform_and_permission_guards(self):
         for extra, args in [({'FAKE_OS': 'Linux'}, ['install']), ({'FAKE_MACOS': '11.7'}, ['install']),

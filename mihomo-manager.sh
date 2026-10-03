@@ -6,7 +6,7 @@ umask 077
 
 LABEL=io.github.sys-toolkit.mihomo
 SYSTEM=0
-BASE='' DOMAIN='' PERSIST='' BIN='' RUN='' WORK='' LOCKED=0 TX_ACTIVE=0 TX_LOADED=0
+BASE='' DOMAIN='' PERSIST='' BIN='' RUN='' WORK='' TUN_STATE='' LOCKED=0 TX_ACTIVE=0 TX_LOADED=0
 TX_TARGETS=()
 ERROR_REPORTED=0
 SCRIPT="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
@@ -87,6 +87,10 @@ usage() {
     help_item 'mm download-proxy set <链接1> [链接2...]' '按顺序设置加速前缀；支持 {url}/{path} 模板，最后回退官方源。'
     help_item 'mm update-core [vX.Y.Z]' '更新内核；省略版本使用最新稳定版。'
     help_item 'mm update-resources [文件名...]' '按 resources.json 更新全部或指定 GEO 数据。'
+    ui_section 'TUN 与系统实例'
+    help_item 'mm --system install' '初始化系统实例（root，开机自启、可创建 utun）。'
+    help_item 'mm --system enable-tun [配置]' '导入配置并启用 TUN：写入开机自启并立即启动校验。'
+    help_item 'mm --system disable-tun' '停止 TUN 实例并移除开机自启，保留配置。'
     ui_section '自启与卸载'
     help_item 'mm autostart enable | disable | status' '管理登录自启；--system 模式管理开机自启。'
     help_item 'mm uninstall [--purge] [--yes]' '默认保留数据；--purge 删除数据，--yes 跳过交互确认。'
@@ -101,7 +105,7 @@ usage() {
     ui_command 'sudo "$HOME/.local/bin/mm" --system info'
     ui_section '环境与显示'
     ui_note 'macOS 12+、Bash 3.2+、Python 3，及系统 curl/gzip/shasum/launchctl/plutil。'
-    ui_note '普通模式勿使用 sudo；初始配置仅直连，TUN 使用系统模式并自行配置。'
+    ui_note '普通模式勿使用 sudo；初始配置仅直连。TUN 必须由 root 运行的系统实例创建：sudo mm --system enable-tun。'
     ui_note 'NO_COLOR=1 mm 关闭颜色；长路径单独显示，输出重定向时为纯文本。'
     printf '\n'
 }
@@ -230,11 +234,21 @@ running() {
     state="$(launchctl print "$DOMAIN/$LABEL" 2>/dev/null)" || return 1
     [[ "$state" == *'state = running'* && "$state" == *'pid = '* ]]
 }
-stop_job() {
-    if loaded; then
-        run_checked '停止服务失败。' launchctl bootout "$DOMAIN/$LABEL" || return 1
-    fi
+# bootout 返回成功不代表旧进程已完全退出；此时立即 bootstrap 同名服务，
+# launchd 会拒绝（Bootstrap failed: 5: Input/output error）。必须等待卸载完成。
+unload_job() {
+    local i
+    loaded || return 0
+    run_checked '停止服务失败。' launchctl bootout "$DOMAIN/$LABEL" || return 1
+    for ((i=0; i<40; i++)); do
+        loaded || return 0
+        sleep 0.25
+    done
+    ui_error '旧服务未在 10 秒内完成卸载，已停止后续操作。' >&2
+    ui_command "launchctl print $DOMAIN/$LABEL" >&2
+    return 1
 }
+stop_job() { unload_job; }
 wait_running() {
     local i hits=0
     for ((i=0; i<10; i++)); do
@@ -251,8 +265,29 @@ boot_job() {
     local plist="$BASE/service.plist"
     [[ -f "$PERSIST" ]] && plist="$PERSIST"
     run_checked '启用 launchd 服务失败。' launchctl enable "$DOMAIN/$LABEL" || return 1
-    run_checked '启动服务失败。' launchctl bootstrap "$DOMAIN" "$plist" || return 1
+    if ! run_checked '启动服务失败。' launchctl bootstrap "$DOMAIN" "$plist"; then
+        ui_note '若提示 Input/output error，通常是旧实例仍在退出；等待数秒后重试。' >&2
+        ui_note '--system 需通过 sudo 运行；用户模式需已登录图形会话。' >&2
+        return 1
+    fi
     wait_running
+}
+# 已加载但进程未运行时用 kickstart 拉起，未加载则注册新 job。
+ensure_running() {
+    if loaded; then
+        if ! running; then run_checked '重新启动服务失败。' launchctl kickstart -k "$DOMAIN/$LABEL" || return 1; fi
+        wait_running
+    else
+        boot_job
+    fi
+}
+
+# 将当前 plist 安装为持久自启项；各模式分别对应 LaunchAgent / LaunchDaemon。
+install_persist_plist() {
+    mkdir -p "$(dirname "$PERSIST")"
+    cp "$BASE/service.plist" "$PERSIST.new"
+    chmod 644 "$PERSIST.new"
+    mv -f "$PERSIST.new" "$PERSIST"
 }
 
 cleanup() {
@@ -306,7 +341,7 @@ check_environment() {
     for dep in python3 curl gzip shasum launchctl plutil; do
         command -v "$dep" >/dev/null 2>&1 || die "缺少依赖 ${dep}；请先安装（Python 3 可通过 Homebrew 或 Xcode Command Line Tools 提供）。"
     done
-    BIN="$BASE/bin/mihomo"; RUN="$BASE/run"
+    BIN="$BASE/bin/mihomo"; RUN="$BASE/run"; TUN_STATE="$BASE/tun-mode"
     # 拒绝管理路径上的符号链接以及非当前用户拥有的文件。
     python_task '管理路径检查失败。' - "$BASE" "$PERSIST" <<'PY'
 import os, pathlib, sys
@@ -659,6 +694,10 @@ cmd_install() {
     if ! manage_shortcut install; then
         ui_warning '内核安装成功，mm 快捷命令未配置；解决上述冲突后运行 shortcut。' >&2
     fi
+    if [[ "$SYSTEM" -eq 1 ]]; then
+        ui_note 'TUN 需要 root 实例，当前已是系统实例。'
+        ui_command 'sudo mm --system enable-tun /path/to/config.yaml'
+    fi
 }
 cmd_update_core() {
     need_install; stage; fetch_core "${1:-latest}"
@@ -669,10 +708,7 @@ cmd_update_core() {
 }
 cmd_start() {
     need_install; stage; validate_candidate "$BIN"; write_plist
-    if loaded; then
-        if ! running; then run_checked '重新启动服务失败。' launchctl kickstart -k "$DOMAIN/$LABEL"; fi
-        wait_running
-    else boot_job; fi
+    ensure_running
     ui_success 'mihomo 正在运行。'
 }
 cmd_test() { need_install; stage; validate_candidate "$BIN"; ui_success '配置测试通过。'; }
@@ -699,6 +735,7 @@ status_fields() {
     elif loaded; then ui_line '服务' '已加载，当前未运行' '33';
     else ui_line '服务' '未加载/已停止' '90'; fi
     autostart_status
+    tun_status
 }
 cmd_status() {
     ui_title '运行状态'
@@ -723,6 +760,7 @@ cmd_info() {
     info_path '资源清单' "$BASE/resources.json"
     info_path '订阅来源记录（不显示内容）' "$BASE/config-url"
     info_path 'UI 自动补充记录' "$BASE/ui-enabled"
+    info_path 'TUN 模式记录' "$TUN_STATE"
     info_path '下载加速设置' "$BASE/download-proxy.json"
     ui_section '程序与快捷入口'
     info_path '内核程序' "$BIN"
@@ -746,6 +784,18 @@ autostart_status() {
     local kind=登录
     [[ "$SYSTEM" -eq 0 ]] || kind=开机
     if [[ -f "$PERSIST" ]]; then ui_line "${kind}自启" '已启用' '32'; else ui_line "${kind}自启" '未启用' '90'; fi
+}
+# TUN 只能由 root 创建的 utun 生效，因此仅系统实例会显示已启用。
+tun_status() {
+    if [[ "$SYSTEM" -eq 0 ]]; then
+        ui_line 'TUN 模式' '未启用（用户实例无权限；用 sudo mm --system enable-tun）' '90'
+    elif [[ -f "$TUN_STATE" ]] && grep -q '^mode=persistent$' "$TUN_STATE" 2>/dev/null; then
+        ui_line 'TUN 模式' '已启用（系统实例 + 开机自启）' '32'
+    elif [[ -f "$TUN_STATE" ]]; then
+        ui_line 'TUN 模式' '系统实例仅手动启动' '90'
+    else
+        ui_line 'TUN 模式' '未记录；请确认 tun.enable 与系统实例状态' '33'
+    fi
 }
 patch_ui_config() {
     ui_step '补充 Web 面板配置…'
@@ -928,8 +978,12 @@ cmd_config_ui() {
     info_path '旧配置备份' "$BASE/backups/previous/run/config.yaml"
     ui_note '缺省面板地址：http://127.0.0.1:9090/ui/；已有 API 地址则使用原地址的 /ui/。'
     info_path '面板静态目录' "$BASE/$UI_REL"
-    ui_note '面板资源已就绪；更新资源可执行 mm update-ui。'
-    ui_command 'mm start'
+    if [[ "$SYSTEM" -eq 1 ]]; then
+        ui_note '系统实例随开机自启运行；未启用自启时执行 sudo mm --system start。'
+    else
+        ui_note '面板资源已就绪；更新资源可执行 mm update-ui。'
+        ui_command 'mm start'
+    fi
 }
 cmd_config() {
     local action="$1" source="${2:-}" files=(run/config.yaml config-url)
@@ -962,6 +1016,149 @@ cmd_config() {
     ui_success '配置已更新。'
     info_path '生效配置' "$RUN/config.yaml"
     info_path '旧配置备份' "$BASE/backups/previous/run/config.yaml"
+}
+# 记录当前实例的 TUN 使用模式，供 status/info 判断显示。
+tun_state_write() { printf 'mode=%s\n' "$1" > "$WORK/candidate/tun-mode"; }
+
+# 仅编辑常见块映射 YAML 中 tun 段的 enable 字段，其余内容保持原样。
+patch_tun_config() {
+    ui_step '确认 TUN 配置…'
+    python_task 'TUN 配置检查失败；旧配置保留。' - "$WORK/candidate/run/config.yaml" <<'PY'
+import re, sys
+path = sys.argv[1]
+try:
+    with open(path, 'rb') as handle:
+        raw = handle.read().decode('utf-8')
+except UnicodeDecodeError:
+    sys.exit('错误：配置文件不是有效的 UTF-8。')
+bom = '\ufeff' if raw.startswith('\ufeff') else ''
+text = raw[len(bom):]
+lines = text.splitlines(keepends=True)
+newline = '\r\n' if '\r\n' in text else '\n'
+roots = []
+for index, line in enumerate(lines):
+    body = line.rstrip('\r\n')
+    stripped = body.lstrip(' ')
+    if not stripped or stripped.startswith('#'):
+        continue
+    if len(body) != len(stripped):
+        continue
+    match = re.match(r'^tun\s*:(.*)$', body)
+    if match:
+        value = match.group(1).strip()
+        if value and not value.startswith('#'):
+            sys.exit('错误：tun 字段不是块映射；请把 tun 改成多行缩进写法后重试。')
+        roots.append(index)
+if not roots:
+    sys.exit('错误：配置没有顶层 tun 段；请传入含 tun 的配置：sudo mm --system enable-tun /path/to/config.yaml。')
+if len(roots) > 1:
+    sys.exit('错误：检测到多个顶层 tun 段，请先整理配置。')
+start = roots[0]
+stop = len(lines)
+for index in range(start + 1, len(lines)):
+    body = lines[index].rstrip('\r\n')
+    stripped = body.lstrip(' ')
+    if not stripped or stripped.startswith('#'):
+        continue
+    if len(body) == len(stripped):
+        stop = index
+        break
+indent = '  '
+for index in range(start + 1, stop):
+    body = lines[index].rstrip('\r\n')
+    stripped = body.lstrip(' ')
+    if stripped and not stripped.startswith('#'):
+        indent = body[:len(body) - len(stripped)]
+        break
+found = [index for index in range(start + 1, stop) if re.match(r'^\s+enable\s*:', lines[index].rstrip('\r\n'))]
+if len(found) > 1:
+    sys.exit('错误：tun 段内存在多个 enable 字段，请先整理配置。')
+if found:
+    index = found[0]
+    match = re.match(r'^(\s+)enable\s*:\s*(.*)$', lines[index].rstrip('\r\n'))
+    value = match.group(2)
+    comment = ''
+    cut = value.find('#')
+    if cut != -1 and (cut == 0 or value[cut - 1].isspace()):
+        value, comment = value[:cut], value[cut:]
+    if value.strip().lower() not in ('', 'true', 'false', 'yes', 'no', 'on', 'off', 'null', '~', "''", '""'):
+        sys.exit('错误：无法安全改写 tun.enable；请手动设为 true。')
+    lines[index] = match.group(1) + 'enable: true' + ((' ' + comment.strip()) if comment.strip() else '') + newline
+else:
+    lines.insert(start + 1, indent + 'enable: true' + newline)
+with open(path, 'wb') as handle:
+    handle.write((bom + ''.join(lines)).encode('utf-8'))
+print('tun.enable 已确认为 true。')
+PY
+}
+cmd_enable_tun() {
+    local source="${1:-}" files=(run/config.yaml) url=''
+    [[ "$SYSTEM" -eq 1 ]] || die '启用 TUN 必须使用系统实例；执行 sudo mm --system enable-tun。'
+    if [[ ! -x "$BIN" || ! -f "$RUN/config.yaml" ]]; then
+        ui_step '系统实例尚未安装内核，先执行安装…'
+        cmd_install latest
+    fi
+    stage
+    if [[ -n "$source" ]]; then
+        if [[ "$source" == https://* ]]; then
+            ui_step '下载远程配置…'
+            download "$source" "$WORK/candidate/run/config.yaml"
+            url="$source"
+        else
+            ui_step '读取本地配置…'
+            [[ -f "$source" ]] || die '需要存在的本地文件或 HTTPS URL。'
+            cp "$source" "$WORK/candidate/run/config.yaml"
+        fi
+        chmod 600 "$WORK/candidate/run/config.yaml"
+    fi
+    patch_tun_config
+    if [[ -n "$url" ]]; then
+        printf '%s\n' "$url" > "$WORK/candidate/config-url"
+        files+=(config-url)
+    fi
+    if [[ -f "$BASE/ui-enabled" ]]; then
+        patch_ui_config
+        prepare_ui
+        if [[ "$UI_CHANGED" -eq 1 ]]; then files+=("$UI_REL"); fi
+        printf 'metacubexd\n' > "$WORK/candidate/ui-enabled"
+        chmod 600 "$WORK/candidate/ui-enabled"
+        files+=(ui-enabled)
+    fi
+    tun_state_write persistent
+    files+=(tun-mode)
+    validate_candidate "$BIN"
+    write_plist
+    # 先写开机自启，commit_files 恢复运行状态时会优先使用持久 plist。
+    install_persist_plist
+    commit_files "${files[@]}"
+    ui_success 'TUN 模式已启用；系统实例已设为开机自启。'
+    info_path '生效配置' "$RUN/config.yaml"
+    info_path 'TUN 模式记录' "$TUN_STATE"
+    info_path '开机自启 plist' "$PERSIST"
+    ui_note '内核以 root 运行；TUN 监听结果以日志为准。'
+    ui_command 'sudo mm --system logs 100'
+    if ! ensure_running; then
+        ui_error '配置已应用，但服务未确认运行；请检查日志后重试。' >&2
+        exit 1
+    fi
+    ui_success 'TUN 实例正在运行。'
+}
+cmd_disable_tun() {
+    local files=(run/config.yaml)
+    [[ "$SYSTEM" -eq 1 ]] || die '关闭 TUN 必须使用系统实例；执行 sudo mm --system disable-tun。'
+    need_install; stage
+    tun_state_write user
+    files+=(tun-mode)
+    if [[ -f "$BASE/ui-enabled" ]]; then files+=(ui-enabled); fi
+    validate_candidate "$BIN"
+    write_plist
+    rm -f "$PERSIST" || die '删除开机自启 plist 失败。'
+    # 先卸载再提交：TX_LOADED=0 时事务不会按旧状态重启服务。
+    unload_job || exit 1
+    commit_files "${files[@]}"
+    ui_success 'TUN 模式已关闭；服务已停止、开机自启已移除，配置保留。'
+    info_path 'TUN 模式记录' "$TUN_STATE"
+    ui_note '需要手动启动时：sudo mm --system start；回到用户实例：sudo mm --system uninstall --yes，再 mm install。'
 }
 cmd_resources() {
     need_install; stage
@@ -1019,10 +1216,7 @@ cmd_autostart() {
     case "$1" in
         enable)
             need_install; stage; validate_candidate "$BIN"; write_plist
-            mkdir -p "$(dirname "$PERSIST")"
-            cp "$BASE/service.plist" "$PERSIST.new"
-            chmod 644 "$PERSIST.new"
-            mv -f "$PERSIST.new" "$PERSIST"
+            install_persist_plist
             stop_job
             boot_job
             autostart_status ;;
@@ -1130,7 +1324,7 @@ def panel(left, right):
 
 service = ('服务管理', [(1, '安装内核', 'number'), (2, '启动服务', 'good'), (3, '停止服务', 'warning'), (4, '重启服务', 'number'), (5, '查看状态', 'number')])
 config = ('配置与更新', [(6, '更新内核', 'number'), (7, '导入配置', 'number'), (8, '更新订阅', 'number'), (9, '更新 GEO 资源', 'number'), (12, '测试配置', 'number'), (17, '配置 Web 面板', 'number'), (18, '更新 UI 包', 'number'), (19, '下载加速设置', 'number')])
-diagnostics = ('自启与诊断', [(10, '启用自启', 'good'), (11, '禁用自启', 'warning'), (13, '查看日志', 'number'), (16, '运行信息 / 目录', 'number')])
+diagnostics = ('自启与诊断', [(10, '启用自启', 'good'), (11, '禁用自启', 'warning'), (13, '查看日志', 'number'), (16, '运行信息 / 目录', 'number'), (20, '启用 TUN', 'good'), (21, '关闭 TUN', 'warning')])
 remove = ('卸载与帮助', [(14, '卸载（保留数据）', 'warning'), (15, '完全卸载', 'danger'), ('h', '用法帮助', 'number'), (0, '退出', 'muted')])
 kind = '系统模式' if system == '1' else '用户模式'
 startup = '开机自启' if system == '1' else '登录自启'
@@ -1181,6 +1375,21 @@ menu() {
                 15) set -- uninstall --purge ;; 16) set -- info ;; h|help|\?) set -- help ;;
                 17) set -- config ui ;;
                 18) set -- update-ui ;;
+                20|21) if [[ "$SYSTEM" -eq 1 ]]; then
+                        set -- enable-tun
+                        [[ "$choice" != 21 ]] || set -- disable-tun
+                        /bin/bash "$SCRIPT" --system "$@" || true
+                    elif command -v sudo >/dev/null 2>&1; then
+                        ui_note '切换 TUN 需要 root 实例，将请求管理员密码。'
+                        if [[ "$choice" == 20 ]]; then
+                            sudo /bin/bash "$SCRIPT" --system enable-tun || ui_warning '已取消或授权失败。'
+                        else
+                            sudo /bin/bash "$SCRIPT" --system disable-tun || ui_warning '已取消或授权失败。'
+                        fi
+                    else
+                        ui_warning '未找到 sudo；请手动执行 sudo mm --system enable-tun。'
+                    fi
+                    continue ;;
                 *) ui_warning '无效选择，请输入菜单编号或 h。'; continue ;;
                 esac
                 /bin/bash "$SCRIPT" ${flags[@]+"${flags[@]}"} "$@" || true ;;
@@ -1196,12 +1405,18 @@ main() {
     # 参数检查先于 mkdir/锁，避免拼写错误造成写操作。
     case "$cmd" in
         install|update-core|logs) [[ "$#" -le 1 ]] || die "$cmd 参数过多。" ;;
+        enable-tun) [[ "$#" -le 1 ]] || die '用法：sudo mm --system enable-tun [配置路径或HTTPS URL]。' ;;
+        disable-tun) [[ "$#" -eq 0 ]] || die 'disable-tun 不接受参数。' ;;
         start|stop|restart|status|info|test|shortcut|update-ui|'') [[ "$#" -eq 0 ]] || die "$cmd 不接受参数。" ;;
         download-proxy) [[ ( "$#" -ge 2 && "$1" == set ) || ( "$#" -eq 1 && ( "$1" == show || "$1" == reset || "$1" == disable ) ) ]] || die '用法：download-proxy show|reset|disable，或 download-proxy set <链接1> [链接2...]。' ;;
         config) [[ ( "$#" -eq 2 && "$1" == set ) || ( "$#" -eq 1 && ( "$1" == update || "$1" == ui ) ) ]] || die '用法：config set <文件/HTTPS URL>、config update 或 config ui。' ;;
         autostart) [[ "$#" -eq 1 ]] || die '用法：autostart enable|disable|status。' ;;
         update-resources|uninstall) ;;
         *) die "未知命令：${cmd}；使用 help 查看用法。" ;;
+    esac
+    # TUN 依赖 root 创建的 utun；在 check_environment/锁之前拒绝，避免创建目录。
+    case "$cmd" in
+        enable-tun|disable-tun) [[ "$SYSTEM" -eq 1 ]] || die "TUN 需要系统实例：sudo mm --system ${cmd}。" ;;
     esac
     check_environment
     if [[ -z "$cmd" ]]; then menu; return; fi
@@ -1215,6 +1430,8 @@ main() {
         update-ui) ui_title '更新 Web 面板'; need_install; stage; cmd_config_ui 1 ;;
         download-proxy) ui_title '下载加速设置'; cmd_download_proxy "$@" ;;
         start) ui_title '启动服务'; cmd_start ;;
+        enable-tun) ui_title '启用 TUN 模式'; cmd_enable_tun "$@" ;;
+        disable-tun) ui_title '关闭 TUN 模式'; cmd_disable_tun ;;
         stop) ui_title '停止服务'; stop_job; ui_success '服务已停止。' ;;
         restart) ui_title '重启服务'; need_install; stop_job; cmd_start ;;
         status) cmd_status ;; test) ui_title '配置测试'; cmd_test ;;

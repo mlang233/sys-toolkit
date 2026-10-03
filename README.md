@@ -35,6 +35,15 @@ chmod +x mihomo-manager.sh
 
 要求：macOS 12+（Apple Silicon / Intel）、Python 3。普通模式不使用 `sudo`；`--system` 模式需要 root 权限。
 
+需要 TUN（虚拟网卡）时，内核必须以 root 运行，两步完成切换：
+
+```bash
+mm stop                                       # 停止用户实例
+sudo "$HOME/.local/bin/mm" --system enable-tun /absolute/path/config.yaml
+```
+
+`enable-tun` 会导入配置、把 `tun.enable` 置为 `true`、写入开机自启并启动校验；`sudo "$HOME/.local/bin/mm" --system disable-tun` 停止并移除自启，配置保留。
+
 安装内核时自动设置 `mm` 快捷命令，也可提前手动设置；当前终端执行：
 
 ```bash

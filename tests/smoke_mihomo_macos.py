@@ -76,6 +76,15 @@ def main():
         valid.write_bytes(old + b'\n# smoke imported config\n')
         manager('config', 'set', str(valid))
         manager('update-core')
+        # 反复重启验证 bootout 异步卸载竞态：之前会在 bootstrap 报 5: Input/output error。
+        for cycle in range(5):
+            valid.write_bytes(old + ('\n# smoke restart cycle ' + str(cycle) + '\n').encode())
+            manager('config', 'set', str(valid))
+        assert '服务：运行中' in manager('status').stdout
+        run('curl', '--fail', '--silent', '--show-error', '--noproxy', '', '--max-time', '30',
+            '--proxy', 'http://127.0.0.1:' + str(port), '--output', str(root/'response2'), 'https://example.com')
+        assert b'Example Domain' in (root/'response2').read_bytes()
+        print('PASS: 5 transactional restarts keep the proxy serving', flush=True)
         if args.ui:
             with socket.socket() as sock:
                 sock.bind(('127.0.0.1', 0))
