@@ -5,7 +5,6 @@
 ## 目录
 
 - [网络代理 (Sing-box / Snell)](#网络代理-sing-box--snell)
-- [macOS mihomo 管理](#macos-mihomo-管理)
 - [系统备份恢复 (rclone)](#系统备份恢复-rclone)
 - [fail2ban 管理](#fail2ban-管理)
 - [Docker 安装](#docker-安装)
@@ -22,37 +21,6 @@ sudo ./server-proxy.sh
 ```
 
 要求：Linux（systemd），root 权限；Sing-box 使用官方通用安装器（deb/rpm、Arch Linux 等）。安装时可选择正式版 / 最新 Beta 版 / 指定版本，其中 Snell 节点需 sing-box ≥ 1.14.0（当前最新正式版 v1.13.19 不支持，需选择 Beta 版）。
-
-## macOS mihomo 管理
-
-mihomo 内核安装与更新、配置订阅、GEO 资源和 Web 面板管理，支持服务启停、自启及卸载。内核与 UI 下载支持多加速源回退，更新失败自动恢复。
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/sephiroth233/sys-toolkit/master/mihomo-manager.sh -o mihomo-manager.sh
-chmod +x mihomo-manager.sh
-./mihomo-manager.sh
-```
-
-要求：macOS 12+（Apple Silicon / Intel）、Python 3。普通模式不使用 `sudo`；`--system` 模式需要 root 权限。
-
-需要 TUN（虚拟网卡）时，内核必须以 root 运行，两步完成切换：
-
-```bash
-mm stop                                       # 停止用户实例
-sudo "$HOME/.local/bin/mm" --system enable-tun /absolute/path/config.yaml
-```
-
-`enable-tun` 会导入配置、把 `tun.enable` 置为 `true`、写入开机自启并启动校验；`sudo "$HOME/.local/bin/mm" --system disable-tun` 停止并移除自启，配置保留。
-
-安装内核时自动设置 `mm` 快捷命令，也可提前手动设置；当前终端执行：
-
-```bash
-./mihomo-manager.sh shortcut
-export PATH="$HOME/.local/bin:$PATH"
-mm
-```
-
-新开终端可直接使用 `mm`；`mm help` 查看用法，`mm info` 查看运行路径。初始配置仅直连，需导入自己的代理配置；脚本不修改系统代理。
 
 ## 系统备份恢复 (rclone)
 
