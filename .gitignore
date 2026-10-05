@@ -1,3 +1,8 @@
 .idea
 docs/
 tests/
+.agents/
+.trellis/
+.gitattributes
+.pi
+agents.md
