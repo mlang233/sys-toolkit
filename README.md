@@ -15,7 +15,7 @@
 Sing-box（Snell / Shadowsocks2022 / VLESS+Reality / Hysteria2 / AnyTLS / SOCKS5 / HTTP）的安装、配置、节点管理与中转。其中 Snell 节点类型自 sing-box 1.14.0 起支持。
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sephiroth233/sys-toolkit/master/server-proxy.sh -o server-proxy.sh
+curl -fsSL https://raw.githubusercontent.com/mlang233/sys-toolkit/master/server-proxy.sh -o server-proxy.sh
 chmod +x server-proxy.sh
 sudo ./server-proxy.sh
 ```
@@ -27,7 +27,7 @@ sudo ./server-proxy.sh
 基于 rclone 的系统备份与恢复，支持 S3 / Cloudflare R2 / 阿里云 OSS / 腾讯云 COS 等云存储。
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sephiroth233/sys-toolkit/master/sys-backup-restore.sh -o sys-backup-restore.sh
+curl -fsSL https://raw.githubusercontent.com/mlang233/sys-toolkit/master/sys-backup-restore.sh -o sys-backup-restore.sh
 chmod +x sys-backup-restore.sh
 sudo ./sys-backup-restore.sh
 ```
@@ -39,7 +39,7 @@ sudo ./sys-backup-restore.sh
 fail2ban 入侵检测和防护的安装、配置、Jail 与 IP 管理。安装时自动检测 SSH 监听端口、journald/传统日志文件以及活动的 UFW，兼容 Debian 13 等默认不安装 `sudo`、不生成 `/var/log/auth.log` 的精简系统。
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sephiroth233/sys-toolkit/master/fail2ban-manager.sh -o fail2ban-manager.sh
+curl -fsSL https://raw.githubusercontent.com/mlang233/sys-toolkit/master/fail2ban-manager.sh -o fail2ban-manager.sh
 chmod +x fail2ban-manager.sh
 sudo ./fail2ban-manager.sh
 ```
@@ -51,7 +51,7 @@ sudo ./fail2ban-manager.sh
 Docker 与 Docker Compose 一键安装，支持国内镜像源（阿里云 / 清华 TUNA）。
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sephiroth233/sys-toolkit/master/docker-install.sh -o docker-install.sh
+curl -fsSL https://raw.githubusercontent.com/mlang233/sys-toolkit/master/docker-install.sh -o docker-install.sh
 chmod +x docker-install.sh
 sudo ./docker-install.sh
 ```
@@ -63,7 +63,7 @@ sudo ./docker-install.sh
 通用 S3 / Cloudflare R2 图床工具箱，支持上传、剪贴板粘贴、删除，也可作为 Typora 自定义上传器。
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sephiroth233/sys-toolkit/master/img.sh -o img.sh
+curl -fsSL https://raw.githubusercontent.com/mlang233/sys-toolkit/master/img.sh -o img.sh
 chmod +x img.sh
 
 # 方式一：直接执行（Typora 兼容）
