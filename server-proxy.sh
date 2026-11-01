@@ -59,6 +59,15 @@ rand_alpha() {
     LC_ALL=C tr -dc a-z </dev/urandom | head -c "${1:-8}"
 }
 
+# 配置和私钥只允许 root 与 sing-box 组读取
+secure_config_perms() {
+    [ -f "${CONFIG_FILE}" ] || return 0
+    if getent group sing-box >/dev/null 2>&1; then
+        chown root:sing-box "${CONFIG_FILE}" 2>/dev/null || true
+        chmod 640 "${CONFIG_FILE}"
+    fi
+}
+
 # 协议显示名称（菜单、列表共用）
 proto_display() {
     case "$1" in
@@ -242,6 +251,14 @@ install_sing_box() {
         exit 1
     }
 
+    # 私钥/证书权限：sing-box 组可读，不依赖 CAP_DAC_READ_SEARCH
+    if getent group sing-box >/dev/null 2>&1; then
+        chown root:sing-box "${CONFIG_DIR}" "${CONFIG_DIR}/private.key" 2>/dev/null || true
+        chmod 750 "${CONFIG_DIR}"
+        chmod 640 "${CONFIG_DIR}/private.key"
+        chmod 644 "${CONFIG_DIR}/cert.pem"
+    fi
+
     # 获取本机 IP 地址和所在国家
     host_ip=$(curl -s http://checkip.amazonaws.com)
     ip_country=$(curl -s http://ipinfo.io/${host_ip}/country)
@@ -249,6 +266,7 @@ install_sing_box() {
     # 参数直接从 config.json 读取
 
     # 生成最小配置文件（初次安装不包含节点信息）
+    # 先解析域名再匹配 ip_is_private，防止域名解析到 loopback/内网绕过代理
     cat > "${CONFIG_FILE}" << EOF
 {
     "log": {
@@ -271,6 +289,10 @@ install_sing_box() {
         },
         "rules": [
             {
+                "action": "resolve",
+                "strategy": "ipv4_only"
+            },
+            {
                 "ip_is_private": true,
                 "outbound": "block"
             }
@@ -292,6 +314,7 @@ install_sing_box() {
     ]
 }
 EOF
+    secure_config_perms
 
     # 启用并启动 sing-box 服务
     systemctl enable "${SERVICE_NAME}" || {
@@ -657,7 +680,7 @@ save_config() {
         return 1
     fi
     # 备份当前配置
-    cp "${CONFIG_FILE}" "${CONFIG_FILE}.backup" || {
+    cp -p "${CONFIG_FILE}" "${CONFIG_FILE}.backup" || {
         echo -e "${RED}错误: 无法备份配置文件${RESET}"
         return 1
     }
@@ -674,6 +697,7 @@ save_config() {
         return 1
     fi
     rm -f "${CONFIG_FILE}.backup"
+    secure_config_perms
 }
 
 # 将选中的协议批量添加到当前配置
@@ -902,12 +926,12 @@ init_protocol_params() {
 
     # 随机密码/密钥
     ss_password=$(sing-box generate rand 32 --base64 2>/dev/null || rand_alnum 32)
-    password=$(rand_alnum 12)
+    password=$(rand_alnum 32)
     snell_psk=$(rand_alnum 32)
     socks_username=$(rand_alpha 8)
-    socks_password=$(rand_alnum 12)
+    socks_password=$(rand_alnum 32)
     http_username=$(rand_alpha 8)
-    http_password=$(rand_alnum 12)
+    http_password=$(rand_alnum 32)
 
     # UUID 和 Reality 密钥对
     uuid=$(sing-box generate uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)
@@ -932,7 +956,7 @@ ensure_protocol_defaults() {
     [ -z "$anytls_port" ] && anytls_port=$(generate_unused_port)
     [ -z "$shadowsocks_port" ] && shadowsocks_port=$(generate_unused_port)
     [ -z "$ss_password" ] && ss_password=$(sing-box generate rand 32 --base64 2>/dev/null || rand_alnum 32)
-    [ -z "$password" ] && password=$(rand_alnum 12)
+    [ -z "$password" ] && password=$(rand_alnum 32)
     [ -z "$uuid" ] && uuid=$(sing-box generate uuid 2>/dev/null || cat /proc/sys/kernel/random/uuid)
     if [ -z "$private_key" ] || [ -z "$public_key" ]; then
         reality_output=$(sing-box generate reality-keypair 2>/dev/null)
@@ -947,9 +971,9 @@ ensure_protocol_defaults() {
     [ -z "$socks_port" ] && socks_port=$(generate_unused_port)
     [ -z "$http_port" ] && http_port=$(generate_unused_port)
     [ -z "$socks_username" ] && socks_username=$(rand_alpha 8)
-    [ -z "$socks_password" ] && socks_password=$(rand_alnum 12)
+    [ -z "$socks_password" ] && socks_password=$(rand_alnum 32)
     [ -z "$http_username" ] && http_username=$(rand_alpha 8)
-    [ -z "$http_password" ] && http_password=$(rand_alnum 12)
+    [ -z "$http_password" ] && http_password=$(rand_alnum 32)
     [ -z "$snell_port" ] && snell_port=$(generate_unused_port)
     [ -z "$snell_psk" ] && snell_psk=$(rand_alnum 32)
     [ -z "$snell_version" ] && snell_version=5
