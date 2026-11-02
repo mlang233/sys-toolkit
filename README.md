@@ -20,7 +20,7 @@ chmod +x server-proxy.sh
 sudo ./server-proxy.sh
 ```
 
-要求：Linux（systemd），root 权限；Sing-box 使用官方通用安装器（deb/rpm、Arch Linux 等）。安装时可选择正式版 / 最新 Beta 版 / 指定版本，其中 Snell 节点需 sing-box ≥ 1.14.0（当前最新正式版 v1.13.19 不支持，需选择 Beta 版）。
+要求：Linux（systemd），root 权限；Sing-box 使用官方通用安装器（deb/rpm、Arch Linux 等）。安装时可选择正式版 / 最新 Beta 版 / 指定版本：正式版自动解析最新稳定版，Beta 自动解析最新预发布版；Snell 节点需 sing-box ≥ 1.14.0，1.14 起的正式版已支持 Snell，无需特意选择 Beta 版。
 
 ## 系统备份恢复 (rclone)
 

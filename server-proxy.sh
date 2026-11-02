@@ -184,8 +184,8 @@ generate_unused_port() {
 # 选择 sing-box 安装版本
 choose_sing_box_version() {
     echo -e "${CYAN}请选择要安装的 sing-box 版本:${RESET}"
-    echo "1. 最新正式版 (推荐，无 Snell 协议)"
-    echo "2. 最新 Beta 版 (包含 Snell 协议，需 1.14.0+)"
+    echo "1. 最新正式版 (推荐，1.14.0+ 已支持 Snell 协议)"
+    echo "2. 最新 Beta 版 (预发布版本，1.14.0+ 支持 Snell 协议)"
     echo "3. 指定版本号"
     read -p "请输入选项编号 (1-3，直接回车默认 1): " version_choice
     version_choice=${version_choice:-1}
@@ -193,12 +193,33 @@ choose_sing_box_version() {
     install_args=()
     case "${version_choice}" in
         1)
+            ensure_command jq jq || return 1
+            local stable_version
+            stable_version=$(curl -fsSL "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | jq -r '.tag_name // empty')
+            stable_version=${stable_version#v}
+            if [ -z "$stable_version" ]; then
+                echo -e "${RED}获取最新正式版版本号失败，请检查 GitHub API 访问${RESET}"
+                echo -e "${YELLOW}可改用选项 3 手动指定版本号${RESET}"
+                return 1
+            fi
+            echo -e "${CYAN}最新正式版: ${stable_version}${RESET}"
+            install_args+=("--version" "$stable_version")
             ;;
         2)
-            install_args+=("--beta")
+            ensure_command jq jq || return 1
+            local beta_version
+            beta_version=$(curl -fsSL "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r '[.[] | select(.prerelease == true)][0].tag_name // empty')
+            beta_version=${beta_version#v}
+            if [ -z "$beta_version" ]; then
+                echo -e "${RED}获取最新 Beta 版版本号失败，请检查 GitHub API 访问${RESET}"
+                echo -e "${YELLOW}可改用选项 3 手动指定版本号${RESET}"
+                return 1
+            fi
+            echo -e "${CYAN}最新 Beta 版: ${beta_version}${RESET}"
+            install_args+=("--version" "$beta_version")
             ;;
         3)
-            read -p "请输入版本号 (如 1.14.0-beta.17): " custom_version
+            read -p "请输入版本号 (如 1.14.4): " custom_version
             if [ -z "$custom_version" ]; then
                 echo -e "${RED}版本号不能为空！${RESET}"
                 return 1
@@ -285,12 +306,12 @@ install_sing_box() {
     "route": {
         "default_domain_resolver": {
             "server": "local-ipv4",
-            "strategy": "ipv4_only"
+            "strategy": "prefer_ipv4"
         },
         "rules": [
             {
                 "action": "resolve",
-                "strategy": "ipv4_only"
+                "strategy": "prefer_ipv4"
             },
             {
                 "ip_is_private": true,
@@ -304,7 +325,7 @@ install_sing_box() {
             "type": "direct",
             "domain_resolver": {
                 "server": "local-ipv4",
-                "strategy": "ipv4_only"
+                "strategy": "prefer_ipv4"
             }
         },
         {
@@ -501,7 +522,7 @@ build_inbound() {
                 '{
                     type: "snell",
                     tag: "snell-in",
-                    listen: "0.0.0.0",
+                    listen: "::",
                     listen_port: ($port | tonumber),
                     version: $version,
                     psk: $psk
@@ -515,7 +536,7 @@ build_inbound() {
                 '{
                     type: "shadowsocks",
                     tag: "shadowsocks-in",
-                    listen: "0.0.0.0",
+                    listen: "::",
                     listen_port: ($port | tonumber),
                     method: "2022-blake3-aes-256-gcm",
                     password: $password,
@@ -531,7 +552,7 @@ build_inbound() {
                 '{
                     type: "vless",
                     tag: "vless-in",
-                    listen: "0.0.0.0",
+                    listen: "::",
                     listen_port: ($port | tonumber),
                     users: [{
                         uuid: $uuid,
@@ -562,7 +583,7 @@ build_inbound() {
                 '{
                     type: "hysteria2",
                     tag: "hysteria-in",
-                    listen: "0.0.0.0",
+                    listen: "::",
                     listen_port: ($port | tonumber),
                     users: [{password: $password}],
                     masquerade: "https://bing.com",
@@ -585,7 +606,7 @@ build_inbound() {
                 '{
                     type: "anytls",
                     tag: "anytls-in",
-                    listen: "0.0.0.0",
+                    listen: "::",
                     listen_port: ($port | tonumber),
                     users: [{
                         name: $uuid,
@@ -607,7 +628,7 @@ build_inbound() {
                 '{
                     type: "socks",
                     tag: "socks-in",
-                    listen: "0.0.0.0",
+                    listen: "::",
                     listen_port: ($port | tonumber),
                     users: [{
                         username: $username,
@@ -624,7 +645,7 @@ build_inbound() {
                 '{
                     type: "http",
                     tag: "http-in",
-                    listen: "0.0.0.0",
+                    listen: "::",
                     listen_port: ($port | tonumber),
                     users: [{
                         username: $username,
@@ -679,6 +700,21 @@ save_config() {
         echo -e "${RED}错误: 生成的配置不是有效的 JSON 格式！${RESET}"
         return 1
     fi
+    # 使用 sing-box 自身校验配置，避免写入无法启动的配置
+    if command -v sing-box >/dev/null 2>&1; then
+        local tmp_config
+        tmp_config=$(mktemp) || {
+            echo -e "${RED}错误: 无法创建临时配置文件${RESET}"
+            return 1
+        }
+        if ! echo "$new_config" > "$tmp_config" || ! sing-box check -c "$tmp_config" >/dev/null 2>&1; then
+            echo -e "${RED}错误: sing-box 配置校验失败，未写入配置文件！${RESET}"
+            sing-box check -c "$tmp_config" 2>&1
+            rm -f "$tmp_config"
+            return 1
+        fi
+        rm -f "$tmp_config"
+    fi
     # 备份当前配置
     cp -p "${CONFIG_FILE}" "${CONFIG_FILE}.backup" || {
         echo -e "${RED}错误: 无法备份配置文件${RESET}"
@@ -698,6 +734,16 @@ save_config() {
     fi
     rm -f "${CONFIG_FILE}.backup"
     secure_config_perms
+}
+
+# 追加 inbound；同 tag 已存在时替换，避免 duplicate inbound tag
+add_or_replace_inbound() {
+    local list=$1
+    local item=$2
+    local tag
+    tag=$(jq -r '.tag' <<< "$item")
+    jq --arg t "$tag" --argjson item "$item" \
+        'map(select(.tag != $t)) + [$item]' <<< "$list"
 }
 
 # 将选中的协议批量添加到当前配置
@@ -730,7 +776,7 @@ append_inbounds() {
             if ! inbound_config=$(build_inbound "$type"); then
                 continue
             fi
-            new_inbounds=$(jq --argjson item "$inbound_config" '. += [$item]' <<< "$new_inbounds")
+            new_inbounds=$(add_or_replace_inbound "$new_inbounds" "$inbound_config")
         done
     else
         for i in "${!PROTOCOL_LIST[@]}"; do
@@ -739,7 +785,7 @@ append_inbounds() {
             if ! inbound_config=$(build_inbound "$type"); then
                 continue
             fi
-            new_inbounds=$(jq --argjson item "$inbound_config" '. += [$item]' <<< "$new_inbounds")
+            new_inbounds=$(add_or_replace_inbound "$new_inbounds" "$inbound_config")
         done
     fi
 
@@ -1226,7 +1272,7 @@ add_direct_config() {
         '{
             tag: $tag,
             type: "direct",
-            listen: "0.0.0.0",
+            listen: "::",
             listen_port: ($port | tonumber),
             override_port: ($override_port | tonumber),
             override_address: $override_address
@@ -1235,9 +1281,12 @@ add_direct_config() {
     # 读取当前配置
     local current_config
     current_config=$(cat "${CONFIG_FILE}")
-    # 确保 inbounds 字段存在，添加新的 Direct 配置到 inbounds
+    # 确保 inbounds 字段存在，添加新的 Direct 配置到 inbounds（同 tag 则替换）
     current_config=$(echo "$current_config" | jq '.inbounds = (.inbounds // [])')
-    current_config=$(echo "$current_config" | jq --argjson item "$direct_config" '.inbounds += [$item]')
+    local current_inbounds
+    current_inbounds=$(echo "$current_config" | jq '.inbounds')
+    current_inbounds=$(add_or_replace_inbound "$current_inbounds" "$direct_config")
+    current_config=$(echo "$current_config" | jq --argjson inbounds "$current_inbounds" '.inbounds = $inbounds')
 
     if [ -z "$current_config" ] || [ "$current_config" == "null" ]; then
         echo -e "${RED}错误: 配置生成失败，jq 操作返回空值！${RESET}"
